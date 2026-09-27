@@ -6,9 +6,11 @@
 #include <binder/Parcel.h>
 #include <sys/ioctl.h>
 #include <utils/StrongPointer.h>
+#include <sys/system_properties.h>
 
 #include <atomic>
 #include <cinttypes>
+#include <cstring>
 #include <map>
 #include <mutex>
 #include <queue>
@@ -678,6 +680,35 @@ bool BinderInterceptor::processInterceptedTransaction(uint64_t tx_id, sp<BBinder
 // Initialization and Entry Point
 // =============================================================================================
 
+// --- In-process rkp_only masking -----------------------------------------------------------
+// keystore2 treats remote_provisioning.*.rkp_only=true as "an RKP miss is fatal". On a unit
+// whose RKP pool is broken/exhausted (Android 16 is rkp-only; a custom AVB key can break RKP
+// provisioning), the attested generateKey never reaches our intercepted KeyMint -> OUT_OF_KEYS
+// -> TapAndPay reports "Device fails attestation" and refuses to save the card. We never
+// resetprop these globally (an obvious detection point); instead we PLT-hook the libc property
+// readers in this process only and report the two rkp_only props unset, so keystore2 takes the
+// hybrid fallback (RKP miss -> Ok(None) -> our KeyMint path).
+static int (*g_real_system_property_get)(const char *, char *) = nullptr;
+static const prop_info *(*g_real_system_property_find)(const char *) = nullptr;
+
+static bool IsRkpOnlyProp(const char *name) {
+    return name && (std::strcmp(name, "remote_provisioning.tee.rkp_only") == 0 ||
+                    std::strcmp(name, "remote_provisioning.strongbox.rkp_only") == 0);
+}
+
+static int hooked_system_property_get(const char *name, char *value) {
+    if (IsRkpOnlyProp(name)) {
+        if (value) value[0] = '\0';
+        return 0;
+    }
+    return g_real_system_property_get ? g_real_system_property_get(name, value) : 0;
+}
+
+static const prop_info *hooked_system_property_find(const char *name) {
+    if (IsRkpOnlyProp(name)) return nullptr;
+    return g_real_system_property_find ? g_real_system_property_find(name) : nullptr;
+}
+
 bool initialize_hooks() {
     auto maps = lsplt::MapInfo::Scan();
 
@@ -707,6 +738,24 @@ bool initialize_hooks() {
     // Register the ioctl hook with LSPLT
     lsplt::RegisterHook(binder_dev, binder_ino, intercept::kIoctlSymbol.data(),
                         reinterpret_cast<void *>(intercepted_ioctl), reinterpret_cast<void **>(&g_original_ioctl));
+
+    // In-process rkp_only mask: hook the libc property readers so keystore2 treats an rkp_only
+    // level as hybrid (RKP miss -> Ok(None)) and the attested generateKey still reaches our
+    // intercepted KeyMint. Only the two rkp_only props are masked; everything else passes through.
+    for (const auto &map : maps) {
+        if (map.path.ends_with("/libc.so")) {
+            lsplt::RegisterHook(map.dev, map.inode, "__system_property_get",
+                                reinterpret_cast<void *>(hooked_system_property_get),
+                                reinterpret_cast<void **>(&g_real_system_property_get));
+            lsplt::RegisterHook(map.dev, map.inode, "__system_property_find",
+                                reinterpret_cast<void *>(hooked_system_property_find),
+                                reinterpret_cast<void **>(&g_real_system_property_find));
+            LOGI("RKP: installed in-process rkp_only mask (libc=%s, get=%p, find=%p)",
+                 map.path.c_str(), reinterpret_cast<void *>(g_real_system_property_get),
+                 reinterpret_cast<void *>(g_real_system_property_find));
+            break;
+        }
+    }
 
     if (!lsplt::CommitHook()) {
         LOGE("lsplt::CommitHook failed.");
